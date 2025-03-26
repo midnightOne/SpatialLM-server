@@ -2,13 +2,14 @@ import asyncio
 import websockets
 import torch
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from spatiallm import Layout
+from transformers import AutoTokenizer, TextIteratorStreamer
+from spatiallm import Layout, SpatialLMLlamaForCausalLM
 import json
 import logging
 from torchsparse import SparseTensor
-from torchsparse.utils.collate import sparse_collate_fn
-from spatiallm.pcd import Compose
+from torchsparse.utils.collate import sparse_collate
+from spatiallm.pcd import Compose, load_o3d_pcd, get_points_and_colors, cleanup_pcd
+from threading import Thread
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -25,7 +26,7 @@ class SpatialLMServer:
         logger.info("Initializing SpatialLM server...")
         # Initialize model and tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForCausalLM.from_pretrained(model_path)
+        self.model = SpatialLMLlamaForCausalLM.from_pretrained(model_path)
         self.model.to("cuda" if torch.cuda.is_available() else "cpu")
         self.model.eval()
         logger.info(f"Model loaded on device: {self.model.device}")
@@ -89,47 +90,144 @@ class SpatialLMServer:
             result.append(box_dict)
         return result
 
-    async def process_point_cloud(self, point_cloud_data):
+    async def process_point_cloud(self, point_cloud_data, websocket):
         try:
             logger.info(f"Processing point cloud with shape: {point_cloud_data.shape}")
             
             # Convert point cloud data to tensor
             point_cloud = self.prepare_point_cloud(point_cloud_data)
             
-            # Prepare prompt
-            prompt = "<|point_start|><|point_pad|><|point_end|>Detect walls, doors, windows, boxes."
-            conversation = [{"role": "user", "content": prompt}]
+            # Prepare prompt with explicit format instructions
+            prompt = """<|point_start|><|point_pad|><|point_end|>Detect walls, doors, windows, and furniture in the room.
+Format each element as:
+wall_0=Wall(ax,ay,az,bx,by,bz,height,thickness)
+door_0=Door(wall_id,position_x,position_y,position_z,width,height)
+window_0=Window(wall_id,position_x,position_y,position_z,width,height)
+bbox_0=Bbox(class_name,position_x,position_y,position_z,angle_z,scale_x,scale_y,scale_z)
+
+Generate a complete room layout with:
+1. Walls forming the room boundary (4 walls)
+2. One door on the back wall
+3. Furniture boxes including:
+   - One bed (large rectangular object)
+   - Two nightstands (small rectangular objects near the bed)
+   - One curtain (thin rectangular object on a wall)
+   - One carpet (flat rectangular object on floor)
+   - One wall decoration (thin rectangular object on wall)
+
+Make sure to:
+1. Start with the walls to define the room boundary
+2. Add exactly one door on the back wall
+3. Place furniture boxes with correct positions and dimensions
+4. Include ALL furniture in the room
+5. Continue generating until you have identified all furniture
+
+Common furniture dimensions:
+- Beds: ~2m long, ~1.5m wide, ~0.5m high
+- Nightstands: ~0.5m wide, ~0.5m deep, ~0.5m high
+- Curtains: ~2m high, ~0.1m thick
+- Carpets: ~2m wide, ~1.5m long, very thin
+- Wall decorations: ~1m wide, ~0.1m thick, ~0.8m high"""
+            
+            conversation = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ]
             input_ids = self.tokenizer.apply_chat_template(
                 conversation, add_generation_prompt=True, return_tensors="pt"
             )
             input_ids = input_ids.to(self.model.device)
 
-            # Generate layout
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    input_ids,
-                    point_clouds=point_cloud,
-                    max_length=4096,
-                    do_sample=True,
-                    temperature=0.6,
-                    top_p=0.95,
-                    top_k=10,
-                    num_beams=1,
-                    return_dict_in_generate=True,
-                    output_scores=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    attention_mask=torch.ones_like(input_ids)
-                )
-                
-                # Process outputs into layout
-                generated_text = self.tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
-                logger.info(f"Generated text: {generated_text}")
-                layout = Layout(generated_text)
-                
-                # Convert layout to bounding boxes
-                boxes = layout.to_boxes()
-                logger.info(f"Generated {len(boxes)} bounding boxes")
-                return boxes, generated_text
+            # Set up streaming with a timeout
+            streamer = TextIteratorStreamer(
+                self.tokenizer, 
+                timeout=20.0, 
+                skip_prompt=True, 
+                skip_special_tokens=True
+            )
+
+            # Generate layout with streaming
+            generate_kwargs = dict(
+                input_ids=input_ids,
+                point_clouds=point_cloud,
+                max_length=4096,  # Increased max length to allow for more objects
+                do_sample=True,
+                temperature=0.7,  # Slightly increased temperature for more diverse outputs
+                top_p=0.95,
+                top_k=10,
+                num_beams=1,
+                streamer=streamer,
+                pad_token_id=self.tokenizer.eos_token_id,
+                attention_mask=torch.ones_like(input_ids)
+            )
+
+            # Start generation in a separate thread
+            thread = Thread(target=self.model.generate, kwargs=generate_kwargs)
+            thread.start()
+
+            # Stream the generated text with a timeout
+            generated_text = ""
+            try:
+                for text in streamer:
+                    if text.strip():  # Only send non-empty text
+                        # Clean up the text by removing extra newlines and duplicates
+                        text = text.strip()
+                        if text not in generated_text:  # Avoid duplicates
+                            # Validate the format
+                            if any(text.startswith(prefix) for prefix in ["wall_", "door_", "window_", "bbox_"]):
+                                # Check for duplicate doors
+                                if text.startswith("door_"):
+                                    if "door_" in generated_text:
+                                        continue
+                                
+                                generated_text += text + "\n"
+                                # Send intermediate results
+                                response = {
+                                    "type": "stream",
+                                    "text": text,
+                                    "layout_text": generated_text.strip()
+                                }
+                                await websocket.send(json.dumps(response, cls=NumpyEncoder))
+                                
+                                # Only stop if we have:
+                                # 1. Exactly 4 walls
+                                # 2. Exactly 1 door
+                                # 3. At least 6 furniture boxes (bed, 2 nightstands, curtain, carpet, wall decoration)
+                                # 4. At least 10 total objects
+                                if (generated_text.count("wall_") == 4 and 
+                                    generated_text.count("door_") == 1 and 
+                                    generated_text.count("bbox_") >= 6 and 
+                                    len(generated_text.split("\n")) >= 10):
+                                    break
+            except Exception as e:
+                logger.error(f"Error during streaming: {str(e)}")
+                # If streaming fails, try to process what we have
+                if generated_text:
+                    layout = Layout(generated_text.strip())
+                    boxes = layout.to_boxes()
+                    response = {
+                        "type": "final",
+                        "boxes": self.boxes_to_dict(boxes),
+                        "layout_text": generated_text.strip()
+                    }
+                    await websocket.send(json.dumps(response, cls=NumpyEncoder))
+                    return boxes, generated_text
+                raise
+
+            # After generation is complete, process the final layout
+            layout = Layout(generated_text.strip())
+            boxes = layout.to_boxes()
+            logger.info(f"Generated {len(boxes)} bounding boxes")
+
+            # Send final results
+            response = {
+                "type": "final",
+                "boxes": self.boxes_to_dict(boxes),
+                "layout_text": generated_text.strip()
+            }
+            await websocket.send(json.dumps(response, cls=NumpyEncoder))
+
+            return boxes, generated_text
         except Exception as e:
             logger.error(f"Error processing point cloud: {str(e)}")
             raise
@@ -144,25 +242,21 @@ class SpatialLMServer:
                 logger.info(f"Received point cloud with shape: {point_cloud.shape}")
                 
                 # Process point cloud and get bounding boxes
-                boxes, generated_text = await self.process_point_cloud(point_cloud)
+                boxes, generated_text = await self.process_point_cloud(point_cloud, websocket)
                 
-                # Convert boxes to JSON-serializable format
-                boxes_dict = self.boxes_to_dict(boxes)
-                
-                # Send results back
-                response = {
-                    "boxes": boxes_dict,
-                    "layout_text": generated_text  # Include the layout text for debugging
-                }
-                logger.info("Sending response back to client")
-                await websocket.send(json.dumps(response, cls=NumpyEncoder))
-                logger.info("Response sent successfully")
         except Exception as e:
             logger.error(f"Error handling connection: {str(e)}")
             raise
 
     async def start_server(self, host="localhost", port=8765):
-        async with websockets.serve(self.handle_connection, host, port):
+        # Increase max message size to 16MB
+        async with websockets.serve(
+            self.handle_connection, 
+            host, 
+            port,
+            max_size=16_777_216,  # 16MB
+            max_queue=32
+        ):
             logger.info(f"Server started on ws://{host}:{port}")
             await asyncio.Future()  # run forever
 
